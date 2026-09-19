@@ -4,26 +4,50 @@ pub struct PhiaString {
     pub len: usize,
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn phia_new_table() -> *mut Vec<u64> {
-    Box::into_raw(Box::new(Vec::new()))
+#[repr(C)]
+pub struct PhiaTable {
+    pub ptr: *mut u64,
+    pub cap: usize,
+    pub len: usize,
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn phia_table_ensure_capacity(table: *mut Vec<u64>, limit: usize) {
-    let vec = unsafe { &mut *table };
-    let required_cap = limit + 1;
+pub extern "C" fn phia_new_table() -> *mut PhiaTable {
+    let vec: Vec<u64> = Vec::new();
+    let table = Box::new(PhiaTable {
+        ptr: vec.as_ptr() as *mut u64,
+        cap: vec.capacity(),
+        len: vec.len(),
+    });
+    // Leak the Vec buffer so Rust doesn't free it when the function exits
+    std::mem::forget(vec);
+    Box::into_raw(table)
+}
 
-    if required_cap > vec.capacity() {
-        let additional = required_cap.saturating_sub(vec.capacity());
-        vec.reserve(additional);
-    }
+#[unsafe(no_mangle)]
+pub extern "C" fn phia_table_ensure_capacity(table: *mut PhiaTable, limit: usize) {
+    let t = unsafe { &mut *table };
+    let required = limit + 1;
 
-    // CRITICAL: Since LLVM writes directly via GEP without updating len,
-    // we MUST bump len before the NEXT reserve(), otherwise Rust's allocator
-    // won't copy the old elements to the new buffer.
-    if required_cap > vec.len() {
-        unsafe { vec.set_len(required_cap); }
+    if required > t.cap {
+        // Reconstruct the Vec from raw parts to use Rust's native allocator
+        let mut vec = unsafe { Vec::from_raw_parts(t.ptr, t.len, t.cap) };
+
+        vec.reserve(required.saturating_sub(t.cap));
+
+        // Because LLVM writes directly to memory behind Rust's back,
+        // we must force the length up so the next reallocation copies the data.
+        unsafe { vec.set_len(required); }
+
+        // Update our C-ABI struct with the new buffer location
+        t.ptr = vec.as_mut_ptr();
+        t.cap = vec.capacity();
+        t.len = required;
+
+        // Leak it again!
+        std::mem::forget(vec);
+    } else if required > t.len {
+        t.len = required;
     }
 }
 
